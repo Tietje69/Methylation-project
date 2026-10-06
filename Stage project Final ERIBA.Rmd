@@ -1,0 +1,488 @@
+---
+title: "Final version ERIBA"
+output: html_document
+date: "2025-11-03"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Installing packages and loading libraries
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+install.packages("xfun")
+
+library(DESeq2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(UpSetR)
+```
+
+## Define settings
+
+In this section filters are added to remove noise from the dataset. By
+doing so, it can be prevented that 'low counts' are indicating
+false-positive results. Only genes with FDR ≤0,01 are counted as
+differentially expressed.
+
+```{r}
+# FDR-cutoff and making outputmap
+fdr_cutoff <- 0.01         
+min_count <- 10            
+in_samples_expr <- 3    
+
+# Making outputmap for saving results in file
+outdir <- "DEG_results"
+dir.create(outdir, showWarnings = FALSE)
+```
+
+## Preparing metadata and countdata
+
+```{r}
+# Raw counts
+counts_raw_eq <- read.table("20250707_Equ03_174libs_readcounts.txt",
+                            header = TRUE, row.names = 1)
+
+# Sample metadata
+coldata_eq <- read.table("20250707_Equ03_174libs_samples.txt",
+                         header = TRUE, row.names = 1)
+```
+
+## Defining and matching columns
+
+In this section columnnames of counts are matched to the rownames of
+metadata. Factors are important for correctly calculating DESeq
+contrasts.
+
+```{r}
+# Remove (X) from column names
+colnames(counts_raw_eq) <- gsub("^X", "", colnames(counts_raw_eq))
+
+# Check if column names match now, if (true) then it matches
+all(rownames(coldata_eq) == colnames(counts_raw_eq))  
+
+# Print differences, if there is no difference, nothing will be printed
+setdiff(rownames(coldata_eq), colnames(counts_raw_eq))
+setdiff(colnames(counts_raw_eq), rownames(coldata_eq))
+
+# Use raw counts as variable
+counts <- counts_raw_eq
+
+# Put factors in metadata
+coldata_eq$Group <- factor(coldata_eq$Group, levels = c("AL","AE","SE","TE","TL"))
+coldata_eq$Tissue <- factor(coldata_eq$Tissue)
+coldata_eq$Sex <- factor(coldata_eq$Sex)
+```
+
+## Define groups in dataset
+
+In this section groups and tissues are defined for further analysis:
+
+1.  **Torpor groups**
+
+*SE = Baseline vs (AE+AL+TE+TL) = Hibernation*
+
+**Why?**
+
+To compare which genes are specifically expressed during hibernation vs
+baseline (SE).
+
+2.  **Temperature groups**
+
+For defining temperature-specific genes between warm and cold samples.
+
+*a. SE = Warm (baseline euthermic state)*
+
+*b. TE + TL = Cold (torpor with low body temperature)*
+
+**Why?**
+
+To identify cold-induced genes without carry-over effects from arousal
+phases. By comparing SE vs (TE+TL), we avoid transcript carry-over from
+AE/AL phases.
+
+```{r}
+# Torpor analysis: SE = Baseline vs (AE+AL+TE+TL) = Hibernation
+grouping_torpor <- setNames(
+  ifelse(coldata_eq$Group == "SE", "Baseline", "Hibernation"), 
+  rownames(coldata_eq)
+)
+
+# Temperature analysis: SE = Warm vs (TE+TL) = Cold
+grouping_temp <- setNames(
+  ifelse(coldata_eq$Group %in% c("TE", "TL"), "Cold", 
+         ifelse(coldata_eq$Group == "SE", "Warm", NA)),
+  rownames(coldata_eq)
+)
+```
+
+## Select tissues
+
+In this section tissues that have SE-samples will be selected. SE can be
+defined as a baseline. BAT and WAT don't contain SE samples, therefore
+they will be excluded for the next steps (for now)
+
+```{r}
+# All tissues
+all_tissues <- sort(unique(coldata_eq$Tissue))
+
+# Select tissues that have SE (baseline)
+tissues_with_SE <- sort(unique(coldata_eq$Tissue[coldata_eq$Group == "SE"]))
+```
+
+BAT and WAT are present in all_tissues, but not in tissues_with_SE,
+since they do not contain any SE-samples.
+
+## DGE per tissue
+
+```{r}
+run_deseq_tissue <- function(tissue_name, grouping_vector, group_levels, prefix) {
+  
+# Collecting all samples for one tissue
+  samp_idx <- which(coldata_eq$Tissue == tissue_name)
+  meta_t <- coldata_eq[samp_idx, , drop = FALSE]
+  counts_t <- counts[, rownames(meta_t), drop = FALSE]
+  
+# Add grouping factor before filtering step
+  meta_t$Group2 <- grouping_vector[rownames(meta_t)]
+  
+# AL/AE samples were excluded from the temperature analysis and assigned 'NA'.
+# This filtering step keeps only relevant samples (Warm vs Cold) for comparing the two stages.
+  valid_idx <- !is.na(meta_t$Group2)
+  meta_t <- meta_t[valid_idx, , drop = FALSE]
+  counts_t <- counts_t[, rownames(meta_t), drop = FALSE]
+  
+# Check if we have samples in both groups
+  group_counts <- table(meta_t$Group2)
+  if(length(group_counts) < 2) {
+    cat("  WARNING: Tissue", tissue_name, "doesn't have samples in both groups. Skipping.\n")
+    return(character(0))
+  }
+  
+# Keep genes with sufficient counts in enough samples to reduce noise
+  keep <- rowSums(counts_t >= min_count) >= in_samples_expr
+  counts_t <- counts_t[keep, ]
+  
+# Convert to factor with correct levels
+  meta_t$Group2 <- factor(meta_t$Group2, levels = group_levels)
+  
+# DESeq DGE analysis
+  dds <- DESeqDataSetFromMatrix(countData = counts_t, colData = meta_t, design = ~ Group2)
+  dds <- DESeq(dds, quiet = TRUE)
+  
+# Yield results (p-adj / FDR usage)
+  res <- results(dds, contrast = c("Group2", group_levels[1], group_levels[2]), alpha = fdr_cutoff)
+  res_df <- as.data.frame(res) %>% 
+    rownames_to_column("Gene_ID") %>% 
+    mutate(Tissue = tissue_name) %>% 
+    arrange(padj)
+  
+# Save all genes
+  write.csv(res_df, file.path(outdir, paste0(prefix, "_", tissue_name, "_all.csv")), row.names = FALSE)
+  
+# Filter significant genes (FDR ≤ 0.01)
+  sig <- res_df %>% filter(!is.na(padj) & padj <= fdr_cutoff)
+  write.csv(sig, file.path(outdir, paste0(prefix, "_", tissue_name, "_sig.csv")), row.names = FALSE)
+  
+
+# Return list of significant Gene_IDs
+  return(sig$Gene_ID)
+}
+```
+
+## DGE between SE vs ALL (Baseline vs Hibernation)
+
+Only for 7 tissues WITH SE samples.
+
+```{r}
+torpor_genes <- list()
+
+# Loop over tissues with SE-samples only
+for(tissue in tissues_with_SE){
+  cat("Running Torpor DGE for tissue:", tissue, "\n")
+  torpor_genes[[tissue]] <- run_deseq_tissue(
+    tissue_name = tissue,
+    grouping_vector = grouping_torpor,
+    group_levels = c("Baseline","Hibernation"),
+    prefix = "Torpor"
+  )
+}
+```
+
+## Temperature DGE-analysis: SE vs (TE+TL)
+
+Only for 7 tissues WITH SE samples
+
+```{r}
+temp_genes <- list()
+
+# Loop over tissues with SE
+for(tissue in all_tissues){
+  cat("Running Temperature DGE for tissue:", tissue, "\n")
+  temp_genes[[tissue]] <- run_deseq_tissue(
+    tissue_name = tissue,
+    grouping_vector = grouping_temp,
+    group_levels = c("Cold","Warm"),
+    prefix = "Temperature"
+  )
+}
+
+# Summary
+cat("\n=== TEMPERATURE ANALYSIS SUMMARY ===\n")
+for(tissue in names(temp_genes)){
+  cat(tissue, ":", length(temp_genes[[tissue]]), "DEGs\n")
+}
+```
+
+## UpSet plot for TORPOR analysis
+
+```{r}
+library(UpSetR)
+
+# Define genes
+all_genes <- rownames(counts)
+
+# Dataframe for UpSet, only for tissues with SE samples
+torpor_upset_df <- lapply(torpor_genes, function(genes) {
+  if (is.null(genes) || length(genes) == 0) genes <- character(0)
+  setNames(as.integer(all_genes %in% genes), all_genes)
+}) %>%
+  do.call(cbind, .) %>%
+  as.data.frame()
+
+# Add column names
+colnames(torpor_upset_df) <- names(torpor_genes)
+
+# UpSet plot
+upset(
+  torpor_upset_df, 
+  nsets = length(torpor_genes), 
+  order.by = "freq", 
+  main.bar.color = "steelblue", 
+  sets.bar.color = "grey40",
+  mainbar.y.label = "Intersection Size (Torpor DEGs)",
+  sets.x.label = "DEGs per Tissue",
+  text.scale = 1.5
+)
+```
+
+| Tissues_in_intersection                         | N_DEGs | Analysis |
+|-------------------------------------------------|--------|----------|
+| Heart                                           | 750    | Torpor   |
+| Liver                                           | 327    | Torpor   |
+| Kidney                                          | 268    | Torpor   |
+| Hypothalamus                                    | 205    | Torpor   |
+| Cerebellum                                      | 80     | Torpor   |
+| Cortex                                          | 73     | Torpor   |
+| Hippocampus                                     | 17     | Torpor   |
+| Heart, Liver                                    | 40     | Torpor   |
+| Heart, Kidney                                   | 33     | Torpor   |
+| Liver, Kidney                                   | 26     | Torpor   |
+| Heart, Hypothalamus                             | 26     | Torpor   |
+| Kidney, Hypothalamus                            | 7      | Torpor   |
+| Heart, Liver, Kidney                            | 7      | Torpor   |
+| Kidney, Cortex                                  | 6      | Torpor   |
+| Cerebellum, Hippocampus                         | 5      | Torpor   |
+| Hypothalamus, Cerebellum                        | 5      | Torpor   |
+| Heart, Cerebellum                               | 5      | Torpor   |
+| Hypothalamus, Hippocampus                       | 4      | Torpor   |
+| Cerebellum, Cortex                              | 2      | Torpor   |
+| Hypothalamus, Cortex                            | 2      | Torpor   |
+| Heart, Liver, Hypothalamus, Cortex, Hippocampus | 2      | Torpor   |
+| Heart, Hippocampus                              | 1      | Torpor   |
+| Heart, Cortex                                   | 1      | Torpor   |
+| Cerebellum, Cortex, Hippocampus                 | 3      | Torpor   |
+| Heart, Cerebellum, Cortex, Hippocampus          | 1      | Torpor   |
+| Kidney, Cerebellum, Cortex, Hypothalamus        | 1      | Torpor   |
+| Liver, Cerebellum, Cortex, Hippocampus          | 1      | Torpor   |
+| Liver, Hypothalamus, Cortex, Hippocampus        | 1      | Torpor   |
+| Liver, Kidney, Hippocampus                      | 1      | Torpor   |
+| Liver, Kidney, Hypothalamus                     | 1      | Torpor   |
+| Heart, Cortex, Hippocampus                      | 1      | Torpor   |
+| Heart, Cerebellum, Cortex, Hippocampus          | 1      | Torpor   |
+
+## UpSet plot for TEMPERATURE analysis
+
+Includes ALL 9 tissues.
+
+```{r}
+# Define genes
+all_genes <- rownames(counts)
+
+# Dataframe for UpSet
+temp_upset_df <- lapply(temp_genes, function(genes) {
+  if (is.null(genes) || length(genes) == 0) genes <- character(0)
+  setNames(as.integer(all_genes %in% genes), all_genes)
+}) %>%
+  do.call(cbind, .) %>%
+  as.data.frame()
+
+# Add column names
+colnames(temp_upset_df) <- names(temp_genes)
+
+# UpSet plot 
+upset(
+  temp_upset_df, 
+  nsets = length(temp_genes),
+  order.by = "freq", 
+  main.bar.color = "tomato3", 
+  sets.bar.color = "grey40",
+  mainbar.y.label = "Intersection Size (Temperature DEGs)",
+  sets.x.label = "DEGs per Tissue",
+  text.scale = 1.5
+)
+```
+
+| Tissues_in_intersection                         | N_DEGs | Analysis    |
+|-------------------------------------------------|--------|-------------|
+| Kidney                                          | 619    | Temperature |
+| Liver                                           | 460    | Temperature |
+| Heart                                           | 431    | Temperature |
+| Cerebellum                                      | 121    | Temperature |
+| Cortex                                          | 71     | Temperature |
+| Hypothalamus                                    | 40     | Temperature |
+| Hippocampus                                     | 18     | Temperature |
+| Kidney, Liver                                   | 65     | Temperature |
+| Kidney, Heart                                   | 32     | Temperature |
+| Liver, Heart                                    | 31     | Temperature |
+| Kidney, Liver, Heart                            | 13     | Temperature |
+| Kidney, Cortex                                  | 12     | Temperature |
+| Cortex, Hippocampus                             | 8      | Temperature |
+| Heart, Cerebellum                               | 8      | Temperature |
+| Liver, Cerebellum                               | 7      | Temperature |
+| Cerebellum, Hippocampus                         | 5      | Temperature |
+| Cerebellum, Hypothalamus                        | 5      | Temperature |
+| Cerebellum, Cortex                              | 5      | Temperature |
+| Kidney, Cerebellum                              | 5      | Temperature |
+| Cortex, Hypothalamus                            | 4      | Temperature |
+| Kidney, Cortex, Hypothalamus                    | 4      | Temperature |
+| Kidney, Liver, Heart, Cerebellum                | 4      | Temperature |
+| All tissues                                     | 4      | Temperature |
+| Cerebellum, Cortex, Hippocampus                 | 3      | Temperature |
+| Heart, Cerebellum, Hypothalamus, Hippocampus    | 3      | Temperature |
+| All tissues except kidney                       | 3      | Temperature |
+| All tissues except hypothalamus and hippocampus | 3      | Temperature |
+| Cerebellum, Cortex, Hypothalamus, Hippocampus   | 2      | Temperature |
+| Heart, Hippocampus                              | 2      | Temperature |
+| Heart, Cortex                                   | 2      | Temperature |
+| Heart, Cerebellum, Hippocampus                  | 2      | Temperature |
+| Liver, Cortex                                   | 2      | Temperature |
+| Liver, Heart, Cerebellum                        | 2      | Temperature |
+| Kidney, Hippocampus                             | 2      | Temperature |
+| Kidney, Hypothalamus                            | 2      | Temperature |
+| Kidney, Cerebellum, Cortex, Hypothalamus        | 2      | Temperature |
+| Kidney, Liver, Cortex                           | 2      | Temperature |
+| Kidney, Liver, Cerebellum                       | 2      | Temperature |
+| Kidney, Liver, Heart, Cortex                    | 2      | Temperature |
+| Kidney, Liver, Heart, Cortex, Hippocampus       | 2      | Temperature |
+
+## Export summary tables
+
+```{r}
+# Torpor summary
+torpor_summary <- data.frame(
+  Tissue = names(torpor_genes),
+  N_DEGs = sapply(torpor_genes, length)
+) %>% arrange(desc(N_DEGs))
+
+write.csv(torpor_summary, file.path(outdir, "Torpor_DEG_summary.csv"), row.names = FALSE)
+
+# Temperature summary
+temp_summary <- data.frame(
+  Tissue = names(temp_genes),
+  N_DEGs = sapply(temp_genes, length)
+) %>% arrange(desc(N_DEGs))
+
+write.csv(temp_summary, file.path(outdir, "Temperature_DEG_summary.csv"), row.names = FALSE)
+```
+
+## PCA analysis
+
+### All tissues
+
+```{r}
+# VST transformation
+dds_all <- DESeqDataSetFromMatrix(countData = counts,
+colData = coldata_eq,
+design = ~ Group)
+vst_all <- vst(dds_all, blind = TRUE)
+
+# PCA
+pca_all <- prcomp(t(assay(vst_all)))
+percentVar <- round(100 * (pca_all$sdev^2 / sum(pca_all$sdev^2)), 1)
+
+# Plotting
+ggplot(data.frame(PC1 = pca_all$x[,1], PC2 = pca_all$x[,2], Tissue = coldata_eq$Tissue),
+aes(PC1, PC2, color = Tissue)) +
+geom_point(size = 3) +
+xlab(paste0("PC1: ", percentVar[1], "%")) +
+ylab(paste0("PC2: ", percentVar[2], "%")) +
+theme_bw()
+
+```
+
+![](images/clipboard-1404968234.png)
+
+Tissue (PC1) explains most of the variance in the samples, PC2
+(hibernation phase) explains the second most variance. Other PC's could
+be sex, individual differences, age, random noise, etc.
+
+### Every tissue individually 
+
+```{r}
+for(tissue in all_tissues){
+idx <- coldata_eq$Tissue == tissue
+dds_t <- DESeqDataSetFromMatrix(countData = counts[, idx],
+colData = coldata_eq[idx, ],
+design = ~ Group)
+vst_t <- vst(dds_t, blind = TRUE)
+pca_t <- prcomp(t(assay(vst_t)))
+percentVar_t <- round(100 * (pca_t$sdev^2 / sum(pca_t$sdev^2)), 1)
+
+ggplot(data.frame(PC1 = pca_t$x[,1], PC2 = pca_t$x[,2], Group = coldata_eq$Group[idx]),
+aes(PC1, PC2, color = Group)) +
+geom_point(size = 3) +
+xlab(paste0("PC1: ", percentVar_t[1], "%")) +
+ylab(paste0("PC2: ", percentVar_t[2], "%")) +
+theme_bw() +
+ggtitle(tissue) -> p
+print(p)
+}
+
+```
+
+## DEG analysis
+
+```{r}
+# Map with all output tables from temperature and hibernation specific DGE analysis
+outdir <- "DEG_results"
+
+# Listing all files from this map
+list.files(outdir, pattern = "\\.csv$", full.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```
